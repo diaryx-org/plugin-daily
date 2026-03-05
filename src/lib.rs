@@ -1,6 +1,44 @@
 //! Extism guest plugin for Diaryx daily entry functionality.
 
 pub mod host_bridge;
+mod daily_logic;
+
+// Custom getrandom backend for Extism WASM guests.
+//
+// `diaryx_core` depends on `uuid` with `rng-getrandom`, which pulls getrandom 0.4.
+// In wasm32-unknown-unknown under wasmtime, JS-backed randomness is unavailable.
+// We provide a deterministic xorshift fallback to satisfy the custom backend hook.
+mod custom_random {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static RNG_STATE: AtomicU64 = AtomicU64::new(0x4d595df4d0f33173);
+
+    fn xorshift_fill(buf: &mut [u8]) {
+        let mut state = RNG_STATE.load(Ordering::Relaxed);
+        if state == 0 {
+            state = 0x4d595df4d0f33173;
+        }
+        for byte in buf.iter_mut() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+        RNG_STATE.store(state, Ordering::Relaxed);
+    }
+
+    #[unsafe(no_mangle)]
+    unsafe extern "Rust" fn __getrandom_v03_custom(
+        dest: *mut u8,
+        len: usize,
+    ) -> Result<(), getrandom_03::Error> {
+        unsafe {
+            let buf = core::slice::from_raw_parts_mut(dest, len);
+            xorshift_fill(buf);
+        }
+        Ok(())
+    }
+}
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -10,7 +48,7 @@ use std::sync::{Mutex, OnceLock};
 use chrono::{Datelike, Local, NaiveDate};
 use diaryx_core::frontmatter;
 use diaryx_core::link_parser::parse_link;
-use diaryx_daily::{
+use daily_logic::{
     DailyDirection, DailyPluginConfig, adjacent_daily_entry_path, default_entry_template,
     parse_date_input, path_to_date, paths_for_date, render_template,
 };
