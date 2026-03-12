@@ -1,6 +1,6 @@
 //! Shared daily-entry domain logic for Diaryx daily plugins.
 
-use chrono::{Duration, Local, NaiveDate};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate};
 use chrono_english::{Dialect, parse_date_string};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -52,16 +52,26 @@ pub struct DailyPaths {
 }
 
 /// Parse an optional date string. `None` defaults to "today".
-pub fn parse_date_input(date: Option<&str>) -> Result<NaiveDate> {
+pub fn parse_date_input(date: Option<&str>, now: DateTime<FixedOffset>) -> Result<NaiveDate> {
     let input = date.unwrap_or("today");
 
     if let Ok(parsed) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
         return Ok(parsed);
     }
 
-    parse_date_string(input, Local::now(), Dialect::Us)
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(input) {
+        return Ok(parsed.date_naive());
+    }
+
+    parse_date_string(input, now, Dialect::Us)
         .map(|dt| dt.date_naive())
         .map_err(|_| DailyError::InvalidDate(input.to_string()))
+}
+
+pub fn parse_rfc3339_date_in_offset(input: &str, offset: &FixedOffset) -> Option<NaiveDate> {
+    DateTime::parse_from_rfc3339(input)
+        .ok()
+        .map(|dt| dt.with_timezone(offset).date_naive())
 }
 
 /// Convert a date to `YYYY/MM/YYYY-MM-DD.md`.
@@ -177,14 +187,20 @@ pub fn paths_for_date(folder: &str, date: NaiveDate) -> DailyPaths {
     }
 }
 
-pub fn render_template(template: &str, title: &str, date: NaiveDate, part_of: &str) -> String {
+pub fn render_template(
+    template: &str,
+    title: &str,
+    date: NaiveDate,
+    part_of: &str,
+    now: &DateTime<FixedOffset>,
+) -> String {
     let mut out = template.to_string();
     out = out.replace("{{title}}", title);
     out = out.replace("{{date}}", &date.format("%Y-%m-%d").to_string());
     out = out.replace("{{part_of}}", part_of);
     out = out.replace(
         "{{timestamp}}",
-        &Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
+        &now.format("%Y-%m-%dT%H:%M:%S%:z").to_string(),
     );
     out
 }
@@ -203,6 +219,10 @@ pub enum DailyDirection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_now() -> DateTime<FixedOffset> {
+        DateTime::parse_from_rfc3339("2026-03-05T10:11:12-07:00").unwrap()
+    }
 
     #[test]
     fn parses_daily_path() {
@@ -232,5 +252,30 @@ mod tests {
         assert_eq!(paths.year_index, "Daily/2026/2026_index.md");
         assert_eq!(paths.month_index, "Daily/2026/03/2026_march.md");
         assert_eq!(paths.entry, "Daily/2026/03/2026-03-02.md");
+    }
+
+    #[test]
+    fn parses_rfc3339_input() {
+        let parsed = parse_date_input(Some("2026-03-02T23:45:00-07:00"), sample_now()).unwrap();
+        assert_eq!(parsed, NaiveDate::from_ymd_opt(2026, 3, 2).unwrap());
+    }
+
+    #[test]
+    fn normalizes_rfc3339_date_to_supplied_offset() {
+        let parsed =
+            parse_rfc3339_date_in_offset("2026-03-06T00:30:00Z", sample_now().offset()).unwrap();
+        assert_eq!(parsed, NaiveDate::from_ymd_opt(2026, 3, 5).unwrap());
+    }
+
+    #[test]
+    fn renders_template_with_supplied_timestamp() {
+        let rendered = render_template(
+            "{{timestamp}}",
+            "Ignored",
+            NaiveDate::from_ymd_opt(2026, 3, 2).unwrap(),
+            "Ignored",
+            &sample_now(),
+        );
+        assert_eq!(rendered, "2026-03-05T10:11:12-07:00");
     }
 }

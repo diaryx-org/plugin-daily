@@ -1,7 +1,7 @@
 //! Extism guest plugin for Diaryx daily entry functionality.
 
-pub mod host_bridge;
 mod daily_logic;
+pub mod host_bridge;
 
 // Custom getrandom backend for Extism WASM guests.
 //
@@ -45,13 +45,14 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-use chrono::{Datelike, Local, NaiveDate};
-use diaryx_core::frontmatter;
-use diaryx_core::link_parser::parse_link;
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate};
 use daily_logic::{
     DailyDirection, DailyPluginConfig, adjacent_daily_entry_path, default_entry_template,
-    parse_date_input, path_to_date, paths_for_date, render_template,
+    normalize_folder, parse_date_input, parse_rfc3339_date_in_offset, path_to_date,
+    paths_for_date, render_template,
 };
+use diaryx_core::frontmatter;
+use diaryx_core::link_parser::parse_link;
 use extism_pdk::*;
 use indexmap::IndexMap;
 use serde_json::Value as JsonValue;
@@ -64,6 +65,8 @@ struct GuestManifest {
     version: String,
     description: String,
     capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requested_permissions: Option<JsonValue>,
     #[serde(default)]
     ui: Vec<JsonValue>,
     #[serde(default)]
@@ -110,6 +113,16 @@ fn current_state() -> Result<DailyState, String> {
         .lock()
         .map_err(|_| "daily plugin state lock poisoned".to_string())?;
     Ok(guard.clone())
+}
+
+fn current_local_datetime() -> Result<DateTime<FixedOffset>, String> {
+    let raw = host_bridge::get_now()?;
+    DateTime::parse_from_rfc3339(raw.trim())
+        .map_err(|e| format!("failed to parse host_get_now response: {e}"))
+}
+
+fn current_local_date() -> Result<NaiveDate, String> {
+    Ok(current_local_datetime()?.date_naive())
 }
 
 fn normalize_rel_path(path: &str) -> String {
@@ -239,6 +252,143 @@ fn save_sequence(frontmatter_map: &mut IndexMap<String, YamlValue>, key: &str, v
     frontmatter_map.insert(key.to_string(), YamlValue::Sequence(seq));
 }
 
+fn root_index_scope(path: Option<&str>) -> String {
+    let Some(path) = path.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "README.md".to_string();
+    };
+
+    let normalized = if is_absolute_path(path) {
+        Path::new(path)
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "README.md".to_string())
+    } else {
+        normalize_rel_path(path)
+    };
+
+    if normalized.is_empty() {
+        "README.md".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn unique_scopes(scopes: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for scope in scopes {
+        if !scope.is_empty() && !out.iter().any(|existing| existing == &scope) {
+            out.push(scope);
+        }
+    }
+    out
+}
+
+fn requested_permissions_for(folder: &str, root_index_path: Option<&str>) -> JsonValue {
+    let folder_scope = normalize_rel_path(folder);
+    let root_scope = root_index_scope(root_index_path);
+    let read_edit_scopes = unique_scopes(vec![folder_scope.clone(), root_scope]);
+
+    serde_json::json!({
+        "defaults": {
+            "read_files": { "include": read_edit_scopes.clone(), "exclude": [] },
+            "edit_files": { "include": read_edit_scopes, "exclude": [] },
+            "create_files": { "include": [folder_scope], "exclude": [] },
+            "plugin_storage": { "include": ["all"], "exclude": [] }
+        },
+        "reasons": {
+            "read_files": "Read daily entries, index files, and optional templates from the workspace.",
+            "edit_files": "Update the root index plus year, month, and daily entry files when organizing the daily hierarchy.",
+            "create_files": "Create missing year, month, and daily entry files for new dates.",
+            "plugin_storage": "Persist daily plugin configuration for the current workspace."
+        }
+    })
+}
+
+fn build_permissions_patch(folder: &str, root_index_path: Option<&str>) -> JsonValue {
+    let defaults = requested_permissions_for(folder, root_index_path)
+        .get("defaults")
+        .cloned()
+        .unwrap_or(JsonValue::Null);
+
+    serde_json::json!({
+        "plugin_permissions_patch": {
+            "plugin_id": "diaryx.daily",
+            "mode": "replace",
+            "permissions": defaults
+        }
+    })
+}
+
+fn root_index_rel_candidates(state: &DailyState) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if let Some(root) = state.workspace_root.as_deref()
+        && root.ends_with(".md")
+    {
+        out.push(root_index_scope(Some(root)));
+    }
+
+    if !out.iter().any(|value| value == "README.md") {
+        out.push("README.md".to_string());
+    }
+
+    out
+}
+
+fn find_existing_root_index_rel(state: &DailyState) -> Result<Option<String>, String> {
+    for candidate in root_index_rel_candidates(state) {
+        let fs_path = to_fs_path(&candidate, state.workspace_root.as_deref());
+        if host_bridge::file_exists(&fs_path)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn extract_entry_folder_update(params: &JsonValue) -> Option<Option<String>> {
+    if params.get("source").and_then(|value| value.as_str()) == Some("workspace_config") {
+        if params.get("field").and_then(|value| value.as_str()) != Some("daily_entry_folder") {
+            return None;
+        }
+
+        let raw_value = params.get("value").and_then(|value| value.as_str()).unwrap_or_default();
+        let normalized = normalize_folder(Some(raw_value));
+        return Some((!normalized.is_empty()).then_some(normalized));
+    }
+
+    let config = params.get("config")?.as_object()?;
+    let value = config.get("entry_folder")?;
+    if value.is_null() {
+        return Some(None);
+    }
+
+    let normalized = normalize_folder(value.as_str());
+    Some((!normalized.is_empty()).then_some(normalized))
+}
+
+fn handle_update_config(params: JsonValue) -> Result<JsonValue, String> {
+    let mut guard = state()
+        .lock()
+        .map_err(|_| "daily plugin state lock poisoned".to_string())?;
+
+    if let Some(next_entry_folder) = extract_entry_folder_update(&params) {
+        guard.config.entry_folder = next_entry_folder;
+        save_workspace_config(&guard)?;
+    }
+
+    let folder = guard.config.effective_entry_folder();
+    let root_index_path = params
+        .get("root_index_path")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            guard
+                .workspace_root
+                .as_deref()
+                .filter(|value| value.ends_with(".md"))
+        });
+    Ok(build_permissions_patch(&folder, root_index_path))
+}
+
 fn ensure_index_file(
     state: &DailyState,
     rel_path: &str,
@@ -354,6 +504,7 @@ fn ensure_daily_entry_for_date(
 ) -> Result<(String, bool), String> {
     let folder = state.config.effective_entry_folder();
     let paths = paths_for_date(&folder, date);
+    let root_index_rel = find_existing_root_index_rel(state)?;
 
     let year_title = date.format("%Y").to_string();
     let month_title = date.format("%B %Y").to_string();
@@ -363,7 +514,7 @@ fn ensure_daily_entry_for_date(
         &paths.daily_index,
         "Daily Index",
         Some("Date-based daily entry hierarchy"),
-        None,
+        root_index_rel.as_deref(),
     )?;
     ensure_index_file(
         state,
@@ -380,6 +531,12 @@ fn ensure_daily_entry_for_date(
         Some(&paths.year_index),
     )?;
 
+    if let Some(root_rel) = root_index_rel.as_deref()
+        && root_rel != paths.daily_index
+    {
+        add_to_contents(state, root_rel, &paths.daily_index)?;
+    }
+
     add_to_contents(state, &paths.daily_index, &paths.year_index)?;
     add_to_contents(state, &paths.year_index, &paths.month_index)?;
 
@@ -389,7 +546,8 @@ fn ensure_daily_entry_for_date(
         let part_of = relative_ref(&paths.entry, &paths.month_index);
         let title = date.format("%B %d, %Y").to_string();
         let template = resolve_template_source(state);
-        let content = render_template(&template, &title, date, &part_of);
+        let now = current_local_datetime()?;
+        let content = render_template(&template, &title, date, &part_of, &now);
         host_bridge::write_file(&entry_fs_path, &content)?;
     }
 
@@ -403,17 +561,24 @@ fn infer_entry_date(path_rel: &str, state: &DailyState) -> Result<NaiveDate, Str
     let fs_path = to_fs_path(path_rel, state.workspace_root.as_deref());
     let content = host_bridge::read_file(&fs_path)?;
     let (fm, _) = parse_markdown(&content)?;
+    let now = current_local_datetime()?;
 
     for key in ["date", "created", "updated"] {
         if let Some(value) = fm.get(key)
             && let Some(raw) = value.as_str()
-            && let Ok(date) = parse_date_input(Some(raw))
         {
-            return Ok(date);
+            if key == "updated"
+                && let Some(date) = parse_rfc3339_date_in_offset(raw, now.offset())
+            {
+                return Ok(date);
+            }
+            if let Ok(date) = parse_date_input(Some(raw), now.clone()) {
+                return Ok(date);
+            }
         }
     }
 
-    parse_date_input(None).map_err(|e| e.to_string())
+    parse_date_input(None, now).map_err(|e| e.to_string())
 }
 
 fn migrate_legacy_config(state_value: &mut DailyState) -> Result<(), String> {
@@ -505,6 +670,7 @@ fn all_commands() -> Vec<String> {
         "ListDailyEntryDates".to_string(),
         "OpenToday".to_string(),
         "OpenYesterday".to_string(),
+        "UpdateConfig".to_string(),
         "CliDaily".to_string(),
         "get_component_html".to_string(),
     ]
@@ -515,7 +681,8 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
 
     match command {
         "EnsureDailyEntry" => {
-            let date = parse_date_input(params.get("date").and_then(|v| v.as_str()))
+            let now = current_local_datetime()?;
+            let date = parse_date_input(params.get("date").and_then(|v| v.as_str()), now)
                 .map_err(|e| e.to_string())?;
             let (path, created) = ensure_daily_entry_for_date(date, &state)?;
             Ok(serde_json::json!({
@@ -569,7 +736,7 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
                 .ok_or("GetEntryState requires `path`")?;
             let rel_path = to_workspace_rel(input_path, state.workspace_root.as_deref());
             if let Ok(date) = path_to_date(&rel_path) {
-                let today = Local::now().date_naive();
+                let today = current_local_date()?;
                 Ok(serde_json::json!({
                     "is_daily": true,
                     "is_today": date == today,
@@ -618,8 +785,9 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
                 }
 
                 let rel_path = to_workspace_rel(&path_raw, state.workspace_root.as_deref());
+                let now = current_local_datetime()?;
                 let date = match explicit_date {
-                    Some(date) => parse_date_input(Some(&date)).map_err(|e| e.to_string()),
+                    Some(date) => parse_date_input(Some(&date), now).map_err(|e| e.to_string()),
                     None => infer_entry_date(&rel_path, &state),
                 };
 
@@ -660,7 +828,7 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
             }))
         }
         "OpenToday" => {
-            let (path, created) = ensure_daily_entry_for_date(Local::now().date_naive(), &state)?;
+            let (path, created) = ensure_daily_entry_for_date(current_local_date()?, &state)?;
             Ok(serde_json::json!({
                 "__diaryx_cli_action": "open_entry",
                 "path": path,
@@ -668,7 +836,7 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
             }))
         }
         "OpenYesterday" => {
-            let date = Local::now().date_naive() - chrono::Duration::days(1);
+            let date = current_local_date()? - Duration::days(1);
             let (path, created) = ensure_daily_entry_for_date(date, &state)?;
             Ok(serde_json::json!({
                 "__diaryx_cli_action": "open_entry",
@@ -676,8 +844,10 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
                 "created": created,
             }))
         }
+        "UpdateConfig" => handle_update_config(params),
         "CliDaily" => {
-            let date = parse_date_input(params.get("date").and_then(|v| v.as_str()))
+            let now = current_local_datetime()?;
+            let date = parse_date_input(params.get("date").and_then(|v| v.as_str()), now)
                 .map_err(|e| e.to_string())?;
             let print = params
                 .get("print")
@@ -757,6 +927,10 @@ pub fn manifest(_input: String) -> FnResult<String> {
         version: env!("CARGO_PKG_VERSION").into(),
         description: "Daily entry plugin with date hierarchy, navigation, and CLI surface".into(),
         capabilities: vec!["workspace_events".into(), "custom_commands".into()],
+        requested_permissions: Some(requested_permissions_for(
+            &DailyPluginConfig::default().effective_entry_folder(),
+            Some("README.md"),
+        )),
         ui: vec![
             serde_json::json!({
                 "slot": "SidebarTab",
@@ -938,4 +1112,45 @@ pub fn on_event(input: String) -> FnResult<String> {
     }
 
     Ok(String::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_requested_permissions_scope_daily_folder_and_root_index() {
+        let permissions = requested_permissions_for("Daily", Some("README.md"));
+        let read_include = permissions["defaults"]["read_files"]["include"]
+            .as_array()
+            .expect("read include array");
+        let create_include = permissions["defaults"]["create_files"]["include"]
+            .as_array()
+            .expect("create include array");
+
+        assert_eq!(read_include.len(), 2);
+        assert_eq!(read_include[0].as_str(), Some("Daily"));
+        assert_eq!(read_include[1].as_str(), Some("README.md"));
+        assert_eq!(create_include[0].as_str(), Some("Daily"));
+    }
+
+    #[test]
+    fn permissions_patch_replaces_daily_file_rules() {
+        let patch = build_permissions_patch("Journal/Daily", Some("/README.md"));
+
+        assert_eq!(
+            patch["plugin_permissions_patch"]["mode"].as_str(),
+            Some("replace")
+        );
+        assert_eq!(
+            patch["plugin_permissions_patch"]["permissions"]["edit_files"]["include"][0]
+                .as_str(),
+            Some("Journal/Daily")
+        );
+        assert_eq!(
+            patch["plugin_permissions_patch"]["permissions"]["edit_files"]["include"][1]
+                .as_str(),
+            Some("README.md")
+        );
+    }
 }
