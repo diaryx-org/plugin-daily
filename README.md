@@ -2,7 +2,7 @@
 title: "Daily"
 description: "Daily entry plugin with date hierarchy, navigation, and CLI surface"
 id: "diaryx.daily"
-version: "0.1.2"
+version: "0.1.3"
 author: "Diaryx Team"
 license: "PolyForm Shield 1.0.0"
 repository: "https://github.com/diaryx-org/plugin-daily"
