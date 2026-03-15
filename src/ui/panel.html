@@ -462,6 +462,37 @@
   function applyTheme(data) {
     var theme = data && data.theme === "dark" ? "dark" : "light";
     document.documentElement.classList.toggle("dark", theme === "dark");
+    if (data && data.cssVars && typeof data.cssVars === "object") {
+      applyCssVars(data.cssVars);
+    }
+  }
+
+  function applyCssVars(vars) {
+    var root = document.documentElement.style;
+    function color(name) {
+      var v = vars[name];
+      if (!v) return null;
+      if (/^(hsl|oklch|rgb|lab|lch|color|#)/i.test(v)) return v;
+      return "hsl(" + v + ")";
+    }
+
+    var map = {
+      "--bg":        color("--background"),
+      "--fg":        color("--foreground"),
+      "--muted":     color("--muted-foreground"),
+      "--border":    color("--border"),
+      "--panel":     color("--card"),
+      "--button":    color("--primary"),
+      "--button-fg": color("--primary-foreground"),
+      "--accent":    color("--accent"),
+      "--danger":    color("--destructive"),
+    };
+
+    for (var local in map) {
+      if (map[local]) root.setProperty(local, map[local]);
+    }
+
+    if (vars["--radius"]) root.setProperty("--radius", vars["--radius"]);
   }
 
   window.addEventListener("message", function(event) {

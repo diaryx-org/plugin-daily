@@ -1,6 +1,6 @@
 [package]
 name = "diaryx_daily_extism"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.91"
 license-file = "LICENSE.md"
@@ -18,10 +18,10 @@ serde_yaml = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
 chrono-english = "0.1"
 indexmap = { version = "2", features = ["serde"] }
+diaryx_plugin_sdk = { path = "../plugin-sdk", features = ["core", "getrandom-shim"] }
 base64 = "0.22"
 pathdiff = "0.2"
 thiserror = "2"
-getrandom_03 = { package = "getrandom", version = "0.3", default-features = false }
 
 [profile.release]
 lto = "fat"

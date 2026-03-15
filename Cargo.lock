@@ -136,20 +136,31 @@ dependencies = [
 
 [[package]]
 name = "diaryx_daily_extism"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "chrono",
  "chrono-english",
  "diaryx_core",
+ "diaryx_plugin_sdk",
  "extism-pdk",
- "getrandom 0.3.4",
  "indexmap",
  "pathdiff",
  "serde",
  "serde_json",
  "serde_yaml",
  "thiserror",
+]
+
+[[package]]
+name = "diaryx_plugin_sdk"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "extism-pdk",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

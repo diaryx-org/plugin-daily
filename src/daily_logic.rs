@@ -209,6 +209,25 @@ pub fn default_entry_template() -> &'static str {
     "---\ntitle: \"{{title}}\"\ndate: {{date}}\ncreated: {{timestamp}}\npart_of: \"{{part_of}}\"\n---\n\n# {{title}}\n\n"
 }
 
+/// Extract a date from just the filename stem (e.g. `2025-09-19.md` → 2025-09-19).
+/// Unlike `path_to_date`, this does NOT require matching `YYYY/MM/` parent directories,
+/// so it works for entries in `contents` that have conforming filenames but may be
+/// in non-standard directory structures.
+pub fn date_from_filename(path: &str) -> Result<NaiveDate> {
+    let path = path.replace('\\', "/");
+    let filename = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&path);
+
+    if !filename.ends_with(".md") {
+        return Err(DailyError::NotDailyPath);
+    }
+
+    let stem = filename.trim_end_matches(".md");
+    NaiveDate::parse_from_str(stem, "%Y-%m-%d").map_err(|_| DailyError::NotDailyPath)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DailyDirection {
@@ -265,6 +284,30 @@ mod tests {
         let parsed =
             parse_rfc3339_date_in_offset("2026-03-06T00:30:00Z", sample_now().offset()).unwrap();
         assert_eq!(parsed, NaiveDate::from_ymd_opt(2026, 3, 5).unwrap());
+    }
+
+    #[test]
+    fn date_from_filename_extracts_date() {
+        let date = date_from_filename("Daily/2025/09/2025-09-19.md").unwrap();
+        assert_eq!(date, NaiveDate::from_ymd_opt(2025, 9, 19).unwrap());
+    }
+
+    #[test]
+    fn date_from_filename_works_without_matching_dirs() {
+        let date = date_from_filename("some/weird/path/2025-09-19.md").unwrap();
+        assert_eq!(date, NaiveDate::from_ymd_opt(2025, 9, 19).unwrap());
+    }
+
+    #[test]
+    fn date_from_filename_bare_filename() {
+        let date = date_from_filename("2025-09-19.md").unwrap();
+        assert_eq!(date, NaiveDate::from_ymd_opt(2025, 9, 19).unwrap());
+    }
+
+    #[test]
+    fn date_from_filename_rejects_non_date() {
+        assert!(date_from_filename("09.md").is_err());
+        assert!(date_from_filename("2025_12.md").is_err());
     }
 
     #[test]

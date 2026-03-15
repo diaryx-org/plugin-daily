@@ -1,55 +1,20 @@
 //! Extism guest plugin for Diaryx daily entry functionality.
 
 mod daily_logic;
-pub mod host_bridge;
 
-// Custom getrandom backend for Extism WASM guests.
-//
-// `diaryx_core` depends on `uuid` with `rng-getrandom`, which pulls getrandom 0.4.
-// In wasm32-unknown-unknown under wasmtime, JS-backed randomness is unavailable.
-// We provide a deterministic xorshift fallback to satisfy the custom backend hook.
-mod custom_random {
-    use std::sync::atomic::{AtomicU64, Ordering};
+use diaryx_plugin_sdk::prelude::*;
 
-    static RNG_STATE: AtomicU64 = AtomicU64::new(0x4d595df4d0f33173);
-
-    fn xorshift_fill(buf: &mut [u8]) {
-        let mut state = RNG_STATE.load(Ordering::Relaxed);
-        if state == 0 {
-            state = 0x4d595df4d0f33173;
-        }
-        for byte in buf.iter_mut() {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *byte = state as u8;
-        }
-        RNG_STATE.store(state, Ordering::Relaxed);
-    }
-
-    #[unsafe(no_mangle)]
-    unsafe extern "Rust" fn __getrandom_v03_custom(
-        dest: *mut u8,
-        len: usize,
-    ) -> Result<(), getrandom_03::Error> {
-        unsafe {
-            let buf = core::slice::from_raw_parts_mut(dest, len);
-            xorshift_fill(buf);
-        }
-        Ok(())
-    }
-}
-
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate};
 use daily_logic::{
-    DailyDirection, DailyPluginConfig, adjacent_daily_entry_path, default_entry_template,
-    normalize_folder, parse_date_input, parse_rfc3339_date_in_offset, path_to_date,
-    paths_for_date, render_template,
+    DailyDirection, DailyPluginConfig, adjacent_daily_entry_path, date_from_filename,
+    default_entry_template, normalize_folder, parse_date_input, parse_rfc3339_date_in_offset,
+    path_to_date, paths_for_date, render_template,
 };
 use diaryx_core::frontmatter;
 use diaryx_core::link_parser::parse_link;
@@ -57,38 +22,6 @@ use extism_pdk::*;
 use indexmap::IndexMap;
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct GuestManifest {
-    id: String,
-    name: String,
-    version: String,
-    description: String,
-    capabilities: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    requested_permissions: Option<JsonValue>,
-    #[serde(default)]
-    ui: Vec<JsonValue>,
-    #[serde(default)]
-    commands: Vec<String>,
-    #[serde(default)]
-    cli: Vec<JsonValue>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CommandRequest {
-    command: String,
-    params: JsonValue,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CommandResponse {
-    success: bool,
-    #[serde(default)]
-    data: Option<JsonValue>,
-    #[serde(default)]
-    error: Option<String>,
-}
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct InitParams {
@@ -102,21 +35,31 @@ struct DailyState {
     config: DailyPluginConfig,
 }
 
-static STATE: OnceLock<Mutex<DailyState>> = OnceLock::new();
-
-fn state() -> &'static Mutex<DailyState> {
-    STATE.get_or_init(|| Mutex::new(DailyState::default()))
+// WASM is single-threaded; use RefCell instead of Mutex to avoid panics on
+// re-entrant host function calls (host may dispatch events while a host_*
+// call is in flight, leading to recursive lock attempts).
+thread_local! {
+    static STATE: RefCell<DailyState> = RefCell::new(DailyState::default());
 }
 
 fn current_state() -> Result<DailyState, String> {
-    let guard = state()
-        .lock()
-        .map_err(|_| "daily plugin state lock poisoned".to_string())?;
-    Ok(guard.clone())
+    STATE.with(|cell| Ok(cell.borrow().clone()))
+}
+
+fn with_state_mut<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce(&mut DailyState) -> Result<R, String>,
+{
+    STATE.with(|cell| {
+        let mut state = cell.borrow().clone();
+        let result = f(&mut state)?;
+        *cell.borrow_mut() = state;
+        Ok(result)
+    })
 }
 
 fn current_local_datetime() -> Result<DateTime<FixedOffset>, String> {
-    let raw = host_bridge::get_now()?;
+    let raw = host::time::now_rfc3339()?;
     DateTime::parse_from_rfc3339(raw.trim())
         .map_err(|e| format!("failed to parse host_get_now response: {e}"))
 }
@@ -187,7 +130,7 @@ fn storage_key_for_workspace(workspace_root: Option<&str>) -> String {
 
 fn load_workspace_config(workspace_root: Option<&str>) -> DailyPluginConfig {
     let key = storage_key_for_workspace(workspace_root);
-    match host_bridge::storage_get(&key) {
+    match host::storage::get(&key) {
         Ok(Some(bytes)) => serde_json::from_slice::<DailyPluginConfig>(&bytes).unwrap_or_default(),
         _ => DailyPluginConfig::default(),
     }
@@ -196,7 +139,7 @@ fn load_workspace_config(workspace_root: Option<&str>) -> DailyPluginConfig {
 fn save_workspace_config(state: &DailyState) -> Result<(), String> {
     let key = storage_key_for_workspace(state.workspace_root.as_deref());
     let bytes = serde_json::to_vec(&state.config).map_err(|e| format!("serialize config: {e}"))?;
-    host_bridge::storage_set(&key, &bytes)?;
+    host::storage::set(&key, &bytes)?;
     Ok(())
 }
 
@@ -224,7 +167,7 @@ fn write_markdown(
     body: &str,
 ) -> Result<(), String> {
     let serialized = frontmatter::serialize(frontmatter_map, body).map_err(|e| e.to_string())?;
-    host_bridge::write_file(fs_path, &serialized)
+    host::fs::write_file(fs_path, &serialized)
 }
 
 fn relative_ref(from_file_rel: &str, to_file_rel: &str) -> String {
@@ -304,6 +247,20 @@ fn requested_permissions_for(folder: &str, root_index_path: Option<&str>) -> Jso
     })
 }
 
+fn build_requested_permissions(folder: &str, root_index_path: Option<&str>) -> GuestRequestedPermissions {
+    let perms = requested_permissions_for(folder, root_index_path);
+    let defaults = perms.get("defaults").cloned().unwrap_or(JsonValue::Null);
+    let reasons_value = perms.get("reasons").cloned().unwrap_or(JsonValue::Null);
+    let reasons = if let Some(obj) = reasons_value.as_object() {
+        obj.iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect::<HashMap<String, String>>()
+    } else {
+        HashMap::new()
+    };
+    GuestRequestedPermissions { defaults, reasons }
+}
+
 fn build_permissions_patch(folder: &str, root_index_path: Option<&str>) -> JsonValue {
     let defaults = requested_permissions_for(folder, root_index_path)
         .get("defaults")
@@ -338,7 +295,7 @@ fn root_index_rel_candidates(state: &DailyState) -> Vec<String> {
 fn find_existing_root_index_rel(state: &DailyState) -> Result<Option<String>, String> {
     for candidate in root_index_rel_candidates(state) {
         let fs_path = to_fs_path(&candidate, state.workspace_root.as_deref());
-        if host_bridge::file_exists(&fs_path)? {
+        if host::fs::file_exists(&fs_path)? {
             return Ok(Some(candidate));
         }
     }
@@ -367,26 +324,25 @@ fn extract_entry_folder_update(params: &JsonValue) -> Option<Option<String>> {
 }
 
 fn handle_update_config(params: JsonValue) -> Result<JsonValue, String> {
-    let mut guard = state()
-        .lock()
-        .map_err(|_| "daily plugin state lock poisoned".to_string())?;
+    with_state_mut(|state| {
+        if let Some(next_entry_folder) = extract_entry_folder_update(&params) {
+            state.config.entry_folder = next_entry_folder;
+            save_workspace_config(state)?;
+        }
 
-    if let Some(next_entry_folder) = extract_entry_folder_update(&params) {
-        guard.config.entry_folder = next_entry_folder;
-        save_workspace_config(&guard)?;
-    }
-
-    let folder = guard.config.effective_entry_folder();
-    let root_index_path = params
-        .get("root_index_path")
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            guard
-                .workspace_root
-                .as_deref()
-                .filter(|value| value.ends_with(".md"))
-        });
-    Ok(build_permissions_patch(&folder, root_index_path))
+        let folder = state.config.effective_entry_folder();
+        let root_index_path = params
+            .get("root_index_path")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                state
+                    .workspace_root
+                    .as_deref()
+                    .filter(|value| value.ends_with(".md"))
+            })
+            .map(|s| s.to_string());
+        Ok(build_permissions_patch(&folder, root_index_path.as_deref()))
+    })
 }
 
 fn ensure_index_file(
@@ -397,10 +353,10 @@ fn ensure_index_file(
     part_of: Option<&str>,
 ) -> Result<bool, String> {
     let fs_path = to_fs_path(rel_path, state.workspace_root.as_deref());
-    let exists = host_bridge::file_exists(&fs_path)?;
+    let exists = host::fs::file_exists(&fs_path)?;
 
     let (mut fm, mut body) = if exists {
-        let content = host_bridge::read_file(&fs_path)?;
+        let content = host::fs::read_file(&fs_path)?;
         parse_markdown(&content)?
     } else {
         (IndexMap::new(), String::new())
@@ -451,7 +407,7 @@ fn ensure_index_file(
 
 fn add_to_contents(state: &DailyState, index_rel: &str, child_rel: &str) -> Result<bool, String> {
     let fs_path = to_fs_path(index_rel, state.workspace_root.as_deref());
-    let content = host_bridge::read_file(&fs_path)?;
+    let content = host::fs::read_file(&fs_path)?;
     let (mut fm, body) = parse_markdown(&content)?;
 
     let mut contents = ensure_sequence(&mut fm, "contents");
@@ -468,7 +424,7 @@ fn add_to_contents(state: &DailyState, index_rel: &str, child_rel: &str) -> Resu
 
 fn set_part_of(state: &DailyState, child_rel: &str, parent_rel: &str) -> Result<(), String> {
     let fs_path = to_fs_path(child_rel, state.workspace_root.as_deref());
-    let content = host_bridge::read_file(&fs_path)?;
+    let content = host::fs::read_file(&fs_path)?;
     let (mut fm, body) = parse_markdown(&content)?;
     let part_of = relative_ref(child_rel, parent_rel);
     fm.insert("part_of".to_string(), YamlValue::String(part_of));
@@ -492,7 +448,7 @@ fn resolve_template_source(state: &DailyState) -> String {
         parsed.path
     };
     let fs_path = to_fs_path(&path_candidate, state.workspace_root.as_deref());
-    match host_bridge::read_file(&fs_path) {
+    match host::fs::read_file(&fs_path) {
         Ok(content) if !content.trim().is_empty() => content,
         _ => default_entry_template().to_string(),
     }
@@ -541,14 +497,14 @@ fn ensure_daily_entry_for_date(
     add_to_contents(state, &paths.year_index, &paths.month_index)?;
 
     let entry_fs_path = to_fs_path(&paths.entry, state.workspace_root.as_deref());
-    let existed = host_bridge::file_exists(&entry_fs_path)?;
+    let existed = host::fs::file_exists(&entry_fs_path)?;
     if !existed {
         let part_of = relative_ref(&paths.entry, &paths.month_index);
         let title = date.format("%B %d, %Y").to_string();
         let template = resolve_template_source(state);
         let now = current_local_datetime()?;
         let content = render_template(&template, &title, date, &part_of, &now);
-        host_bridge::write_file(&entry_fs_path, &content)?;
+        host::fs::write_file(&entry_fs_path, &content)?;
     }
 
     set_part_of(state, &paths.entry, &paths.month_index)?;
@@ -559,7 +515,7 @@ fn ensure_daily_entry_for_date(
 
 fn infer_entry_date(path_rel: &str, state: &DailyState) -> Result<NaiveDate, String> {
     let fs_path = to_fs_path(path_rel, state.workspace_root.as_deref());
-    let content = host_bridge::read_file(&fs_path)?;
+    let content = host::fs::read_file(&fs_path)?;
     let (fm, _) = parse_markdown(&content)?;
     let now = current_local_datetime()?;
 
@@ -589,11 +545,11 @@ fn migrate_legacy_config(state_value: &mut DailyState) -> Result<(), String> {
     let mut migrated_any = false;
 
     for candidate in find_root_index_candidates(state_value.workspace_root.as_deref()) {
-        if !host_bridge::file_exists(&candidate)? {
+        if !host::fs::file_exists(&candidate)? {
             continue;
         }
 
-        let content = host_bridge::read_file(&candidate)?;
+        let content = host::fs::read_file(&candidate)?;
         let (mut fm, body) = parse_markdown(&content)?;
         let mut file_changed = false;
 
@@ -631,7 +587,7 @@ fn migrate_legacy_config(state_value: &mut DailyState) -> Result<(), String> {
     }
 
     if migrated_any {
-        host_bridge::log_message(
+        host::log::log(
             "info",
             "Migrated legacy daily workspace keys into plugin config",
         );
@@ -643,14 +599,24 @@ fn migrate_legacy_config(state_value: &mut DailyState) -> Result<(), String> {
 }
 
 fn update_workspace_root(workspace_root: Option<String>) -> Result<(), String> {
-    let mut guard = state()
-        .lock()
-        .map_err(|_| "daily plugin state lock poisoned".to_string())?;
+    // Step 1: Always persist the workspace root and loaded config,
+    // even if migration later fails.
+    with_state_mut(|state| {
+        state.workspace_root = workspace_root;
+        state.config = load_workspace_config(state.workspace_root.as_deref());
+        Ok(())
+    })?;
 
-    guard.workspace_root = workspace_root;
-    guard.config = load_workspace_config(guard.workspace_root.as_deref());
-    migrate_legacy_config(&mut guard)?;
-    save_workspace_config(&guard)?;
+    // Step 2: Attempt migration (reads/writes files). Non-fatal —
+    // if this fails, the workspace root is still set from step 1.
+    let migration_result = with_state_mut(|state| {
+        migrate_legacy_config(state)?;
+        save_workspace_config(state)?;
+        Ok(())
+    });
+    if let Err(e) = migration_result {
+        host::log::log("warn", &format!("Legacy config migration failed: {e}"));
+    }
     Ok(())
 }
 
@@ -674,6 +640,126 @@ fn all_commands() -> Vec<String> {
         "CliDaily".to_string(),
         "get_component_html".to_string(),
     ]
+}
+
+/// Resolve a `contents` entry (markdown link or plain path) into a workspace-relative path.
+///
+/// `parent_rel` is the workspace-relative path of the file containing the `contents` array.
+/// Workspace-root paths (starting with `/`) are resolved directly; relative paths are
+/// resolved against the parent file's directory.
+fn resolve_link_path(entry: &str, parent_rel: &str) -> String {
+    let parsed = parse_link(entry);
+    let raw = if parsed.path.is_empty() {
+        entry.trim().to_string()
+    } else {
+        parsed.path
+    };
+
+    // Workspace-root paths (parse_link strips the leading `/`)
+    // are already workspace-relative after normalize_rel_path.
+    // Relative paths need to be joined with the parent's directory.
+    if entry.contains("(/") || entry.contains("(</") || raw.starts_with('/') {
+        // Workspace-root link — parse_link already stripped the `/`
+        normalize_rel_path(&raw)
+    } else {
+        // Relative link — resolve against the parent file's directory
+        let parent_dir = Path::new(parent_rel)
+            .parent()
+            .unwrap_or(Path::new(""));
+        let joined = parent_dir.join(&raw);
+        normalize_rel_path(&joined.to_string_lossy())
+    }
+}
+
+/// Walk the contents tree from `daily_index.md` → year index → month index
+/// to find the month index path for a given year/month.
+///
+/// Returns `Ok(Some(path))` if found, `Ok(None)` if the tree doesn't contain
+/// a matching year or month, `Err` on read failures.
+fn find_month_index_via_tree(
+    state: &DailyState,
+    year: i32,
+    month: u32,
+) -> Result<Option<String>, String> {
+    let folder = state.config.effective_entry_folder();
+    let daily_index_rel = daily_logic::scoped_path(&folder, "daily_index.md");
+    let daily_index_fs = to_fs_path(&daily_index_rel, state.workspace_root.as_deref());
+
+    // Read daily_index.md
+    let content = match host::fs::read_file(&daily_index_fs) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let (fm, _) = parse_markdown(&content)?;
+    let daily_contents = ensure_sequence(&mut fm.clone(), "contents");
+
+    // Find matching year index
+    let year_str = format!("{year}");
+    let year_segment = format!("/{year}/");
+    let mut year_index_rel = None;
+    for entry in &daily_contents {
+        let path = resolve_link_path(entry, &daily_index_rel);
+        if path.contains(&year_segment) || path.contains(&format!("/{year_str}_")) {
+            year_index_rel = Some(path);
+            break;
+        }
+    }
+
+    let year_index_rel = match year_index_rel {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    // Read year index
+    let year_index_fs = to_fs_path(&year_index_rel, state.workspace_root.as_deref());
+    let content = match host::fs::read_file(&year_index_fs) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let (fm, _) = parse_markdown(&content)?;
+    let year_contents = ensure_sequence(&mut fm.clone(), "contents");
+
+    // Find matching month index
+    let month_segment = format!("/{month:02}/");
+    for entry in &year_contents {
+        let path = resolve_link_path(entry, &year_index_rel);
+        if path.contains(&month_segment) {
+            return Ok(Some(path));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Read a month index file and extract day numbers from its `contents` entries
+/// that match the given year/month.
+fn dates_from_month_index(
+    state: &DailyState,
+    month_index_rel: &str,
+    year: i32,
+    month: u32,
+) -> Result<Vec<u32>, String> {
+    let fs_path = to_fs_path(month_index_rel, state.workspace_root.as_deref());
+    let content = host::fs::read_file(&fs_path)?;
+    let (fm, _) = parse_markdown(&content)?;
+    let contents = ensure_sequence(&mut fm.clone(), "contents");
+
+    let mut days = Vec::new();
+    for entry in &contents {
+        let path = resolve_link_path(entry, month_index_rel);
+
+        // Try strict path_to_date first, then fall back to filename parsing
+        let date = path_to_date(&path)
+            .or_else(|_| date_from_filename(&path));
+
+        if let Ok(date) = date {
+            if date.year() == year && date.month() == month {
+                days.push(date.day());
+            }
+        }
+    }
+
+    Ok(days)
 }
 
 fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, String> {
@@ -856,7 +942,7 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
             let (path, created) = ensure_daily_entry_for_date(date, &state)?;
             if print {
                 let content =
-                    host_bridge::read_file(&to_fs_path(&path, state.workspace_root.as_deref()))?;
+                    host::fs::read_file(&to_fs_path(&path, state.workspace_root.as_deref()))?;
                 Ok(serde_json::json!({
                     "__diaryx_cli_action": "print",
                     "text": content,
@@ -884,12 +970,22 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
                 return Err("month must be 1-12".to_string());
             }
             let folder = state.config.effective_entry_folder();
+
+            let mut dates: Vec<u32> = Vec::new();
+
+            // Phase 1: Tree walk (primary) — reads daily_index → year index → month index
+            if let Ok(Some(month_index_rel)) = find_month_index_via_tree(&state, year, month) {
+                if let Ok(tree_dates) = dates_from_month_index(&state, &month_index_rel, year, month) {
+                    dates.extend(tree_dates);
+                }
+            }
+
+            // Phase 2: Filesystem scan (supplement) — catches unlisted entries
             let prefix = to_fs_path(
                 &format!("{folder}/{year}/{month:02}/"),
                 state.workspace_root.as_deref(),
             );
-            let files = host_bridge::list_files(&prefix).unwrap_or_default();
-            let mut dates: Vec<u32> = Vec::new();
+            let files = host::fs::list_files(&prefix).unwrap_or_default();
             for file in &files {
                 if let Ok(date) = path_to_date(file) {
                     if date.year() == year && date.month() == month {
@@ -897,6 +993,7 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
                     }
                 }
             }
+
             dates.sort();
             dates.dedup();
             Ok(serde_json::json!({
@@ -922,12 +1019,13 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
 #[plugin_fn]
 pub fn manifest(_input: String) -> FnResult<String> {
     let manifest = GuestManifest {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
         id: "diaryx.daily".into(),
         name: "Daily".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         description: "Daily entry plugin with date hierarchy, navigation, and CLI surface".into(),
         capabilities: vec!["workspace_events".into(), "custom_commands".into()],
-        requested_permissions: Some(requested_permissions_for(
+        requested_permissions: Some(build_requested_permissions(
             &DailyPluginConfig::default().effective_entry_folder(),
             Some("README.md"),
         )),
@@ -990,13 +1088,13 @@ pub fn manifest(_input: String) -> FnResult<String> {
 pub fn init(input: String) -> FnResult<String> {
     let params: InitParams = serde_json::from_str(&input).unwrap_or_default();
     update_workspace_root(params.workspace_root).map_err(extism_pdk::Error::msg)?;
-    host_bridge::log_message("info", "Daily plugin initialized");
+    host::log::log("info", "Daily plugin initialized");
     Ok(String::new())
 }
 
 #[plugin_fn]
 pub fn shutdown(_input: String) -> FnResult<String> {
-    host_bridge::log_message("info", "Daily plugin shutdown");
+    host::log::log("info", "Daily plugin shutdown");
     Ok(String::new())
 }
 
@@ -1004,16 +1102,8 @@ pub fn shutdown(_input: String) -> FnResult<String> {
 pub fn handle_command(input: String) -> FnResult<String> {
     let req: CommandRequest = serde_json::from_str(&input)?;
     let response = match dispatch_command(&req.command, req.params) {
-        Ok(data) => CommandResponse {
-            success: true,
-            data: Some(data),
-            error: None,
-        },
-        Err(error) => CommandResponse {
-            success: false,
-            data: None,
-            error: Some(error),
-        },
+        Ok(data) => CommandResponse::ok(data),
+        Err(error) => CommandResponse::err(error),
     };
 
     Ok(serde_json::to_string(&response)?)
@@ -1050,22 +1140,23 @@ pub fn get_config(_input: String) -> FnResult<String> {
 
 #[plugin_fn]
 pub fn set_config(input: String) -> FnResult<String> {
-    let mut guard = state()
-        .lock()
-        .map_err(|_| extism_pdk::Error::msg("daily plugin state lock poisoned"))?;
-    let mut config: DailyPluginConfig = serde_json::from_str(&input).unwrap_or_default();
+    with_state_mut(|state| {
+        let mut config: DailyPluginConfig = serde_json::from_str(&input).unwrap_or_default();
 
-    if let Some(folder) = config.entry_folder.as_deref() {
-        config.entry_folder = Some(folder.trim_matches('/').to_string());
-    }
+        if let Some(folder) = config.entry_folder.as_deref() {
+            config.entry_folder = Some(folder.trim_matches('/').to_string());
+        }
 
-    guard.config.entry_folder = config.entry_folder;
-    guard.config.entry_template = config.entry_template;
-    if config.migrated_legacy_config {
-        guard.config.migrated_legacy_config = true;
-    }
+        state.config.entry_folder = config.entry_folder;
+        state.config.entry_template = config.entry_template;
+        if config.migrated_legacy_config {
+            state.config.migrated_legacy_config = true;
+        }
 
-    save_workspace_config(&guard).map_err(extism_pdk::Error::msg)?;
+        save_workspace_config(state)?;
+        Ok(())
+    })
+    .map_err(extism_pdk::Error::msg)?;
     Ok(String::new())
 }
 
@@ -1132,6 +1223,46 @@ mod tests {
         assert_eq!(read_include[0].as_str(), Some("Daily"));
         assert_eq!(read_include[1].as_str(), Some("README.md"));
         assert_eq!(create_include[0].as_str(), Some("Daily"));
+    }
+
+    #[test]
+    fn resolve_link_path_workspace_root_link() {
+        // Workspace-root markdown link — path starts with /
+        let resolved = resolve_link_path(
+            "[2026 Index](/Daily/2026/2026_index.md)",
+            "Daily/daily_index.md",
+        );
+        assert_eq!(resolved, "Daily/2026/2026_index.md");
+    }
+
+    #[test]
+    fn resolve_link_path_relative_link() {
+        // Relative link stored by add_to_contents — no leading /
+        let resolved = resolve_link_path(
+            "2026/2026_index.md",
+            "Daily/daily_index.md",
+        );
+        assert_eq!(resolved, "Daily/2026/2026_index.md");
+    }
+
+    #[test]
+    fn resolve_link_path_angle_bracket_root_link() {
+        // Angle-bracket workspace-root link (spaces in filename)
+        let resolved = resolve_link_path(
+            "[2025 03 Entries](</Daily/2025/03/2025-03 entries.md>)",
+            "Daily/2025/2025_index.md",
+        );
+        assert_eq!(resolved, "Daily/2025/03/2025-03 entries.md");
+    }
+
+    #[test]
+    fn resolve_link_path_relative_entry_from_month_index() {
+        // Relative entry link from a month index
+        let resolved = resolve_link_path(
+            "2025-09-19.md",
+            "Daily/2025/09/09.md",
+        );
+        assert_eq!(resolved, "Daily/2025/09/2025-09-19.md");
     }
 
     #[test]
