@@ -1019,10 +1019,10 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
 #[plugin_fn]
 pub fn manifest(_input: String) -> FnResult<String> {
     let manifest = GuestManifest::new(
-        "diaryx.daily".into(),
-        "Daily".into(),
-        env!("CARGO_PKG_VERSION").into(),
-        "Daily entry plugin with date hierarchy, navigation, and CLI surface".into(),
+        "diaryx.daily",
+        "Daily",
+        env!("CARGO_PKG_VERSION"),
+        "Daily entry plugin with date hierarchy, navigation, and CLI surface",
         vec!["workspace_events".into(), "custom_commands".into()],
     )
     .ui(vec![
