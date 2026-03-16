@@ -1018,68 +1018,67 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
 
 #[plugin_fn]
 pub fn manifest(_input: String) -> FnResult<String> {
-    let manifest = GuestManifest {
-        protocol_version: CURRENT_PROTOCOL_VERSION,
-        id: "diaryx.daily".into(),
-        name: "Daily".into(),
-        version: env!("CARGO_PKG_VERSION").into(),
-        description: "Daily entry plugin with date hierarchy, navigation, and CLI surface".into(),
-        capabilities: vec!["workspace_events".into(), "custom_commands".into()],
-        requested_permissions: Some(build_requested_permissions(
-            &DailyPluginConfig::default().effective_entry_folder(),
-            Some("README.md"),
-        )),
-        ui: vec![
-            serde_json::json!({
-                "slot": "SidebarTab",
-                "id": "daily-panel",
-                "label": "Daily",
-                "icon": "calendar-days",
-                "side": "Left",
-                "component": {
-                    "type": "Iframe",
-                    "component_id": "daily.panel",
-                },
-            }),
-            serde_json::json!({
-                "slot": "CommandPaletteItem",
-                "id": "daily-open-today",
-                "label": "Open Today's Entry",
-                "group": "Daily",
-                "plugin_command": "OpenToday",
-            }),
-            serde_json::json!({
-                "slot": "CommandPaletteItem",
-                "id": "daily-open-yesterday",
-                "label": "Open Yesterday's Entry",
-                "group": "Daily",
-                "plugin_command": "OpenYesterday",
-            }),
-        ],
-        commands: all_commands(),
-        cli: vec![serde_json::json!({
-            "name": "daily",
-            "about": "Open or print a daily entry",
-            "aliases": ["d"],
-            "command_name": "CliDaily",
-            "requires_workspace": true,
-            "args": [
-                {
-                    "name": "date",
-                    "help": "Date expression (today, yesterday, YYYY-MM-DD)",
-                    "required": false,
-                    "value_type": "String"
-                },
-                {
-                    "name": "print",
-                    "help": "Print entry content instead of launching editor",
-                    "short": "p",
-                    "long": "print",
-                    "is_flag": true
-                }
-            ]
-        })],
-    };
+    let manifest = GuestManifest::new(
+        "diaryx.daily".into(),
+        "Daily".into(),
+        env!("CARGO_PKG_VERSION").into(),
+        "Daily entry plugin with date hierarchy, navigation, and CLI surface".into(),
+        vec!["workspace_events".into(), "custom_commands".into()],
+    )
+    .ui(vec![
+        serde_json::json!({
+            "slot": "SidebarTab",
+            "id": "daily-panel",
+            "label": "Daily",
+            "icon": "calendar-days",
+            "side": "Left",
+            "component": {
+                "type": "Iframe",
+                "component_id": "daily.panel",
+            },
+        }),
+        serde_json::json!({
+            "slot": "CommandPaletteItem",
+            "id": "daily-open-today",
+            "label": "Open Today's Entry",
+            "group": "Daily",
+            "plugin_command": "OpenToday",
+        }),
+        serde_json::json!({
+            "slot": "CommandPaletteItem",
+            "id": "daily-open-yesterday",
+            "label": "Open Yesterday's Entry",
+            "group": "Daily",
+            "plugin_command": "OpenYesterday",
+        }),
+    ])
+    .commands(all_commands())
+    .cli(vec![serde_json::json!({
+        "name": "daily",
+        "about": "Open or print a daily entry",
+        "aliases": ["d"],
+        "command_name": "CliDaily",
+        "requires_workspace": true,
+        "args": [
+            {
+                "name": "date",
+                "help": "Date expression (today, yesterday, YYYY-MM-DD)",
+                "required": false,
+                "value_type": "String"
+            },
+            {
+                "name": "print",
+                "help": "Print entry content instead of launching editor",
+                "short": "p",
+                "long": "print",
+                "is_flag": true
+            }
+        ]
+    })])
+    .requested_permissions(build_requested_permissions(
+        &DailyPluginConfig::default().effective_entry_folder(),
+        Some("README.md"),
+    ));
 
     Ok(serde_json::to_string(&manifest)?)
 }
