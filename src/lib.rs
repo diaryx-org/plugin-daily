@@ -17,7 +17,9 @@ use daily_logic::{
     path_to_date, paths_for_date, render_template,
 };
 use diaryx_core::frontmatter;
-use diaryx_core::link_parser::parse_link;
+use diaryx_core::link_parser::{
+    format_link_with_format, parse_link, to_canonical_with_link_format, LinkFormat,
+};
 use extism_pdk::*;
 use indexmap::IndexMap;
 use serde_json::Value as JsonValue;
@@ -33,6 +35,7 @@ struct InitParams {
 struct DailyState {
     workspace_root: Option<String>,
     config: DailyPluginConfig,
+    link_format: LinkFormat,
 }
 
 // WASM is single-threaded; use RefCell instead of Mutex to avoid panics on
@@ -170,11 +173,79 @@ fn write_markdown(
     host::fs::write_file(fs_path, &serialized)
 }
 
-fn relative_ref(from_file_rel: &str, to_file_rel: &str) -> String {
-    let from_dir = Path::new(from_file_rel).parent().unwrap_or(Path::new(""));
-    let to_path = Path::new(to_file_rel);
-    let rel = pathdiff::diff_paths(to_path, from_dir).unwrap_or_else(|| to_path.to_path_buf());
-    rel.to_string_lossy().replace('\\', "/")
+fn parse_link_format_str(s: &str) -> Option<LinkFormat> {
+    match s {
+        "markdown_root" => Some(LinkFormat::MarkdownRoot),
+        "markdown_relative" => Some(LinkFormat::MarkdownRelative),
+        "plain_relative" => Some(LinkFormat::PlainRelative),
+        "plain_canonical" => Some(LinkFormat::PlainCanonical),
+        _ => None,
+    }
+}
+
+fn read_link_format(state: &DailyState) -> LinkFormat {
+    let root_rel = match find_existing_root_index_rel(state) {
+        Ok(Some(rel)) => rel,
+        _ => return LinkFormat::default(),
+    };
+    let fs_path = to_fs_path(&root_rel, state.workspace_root.as_deref());
+    let content = match host::fs::read_file(&fs_path) {
+        Ok(c) => c,
+        Err(_) => return LinkFormat::default(),
+    };
+    let (fm, _) = match parse_markdown(&content) {
+        Ok(v) => v,
+        Err(_) => return LinkFormat::default(),
+    };
+
+    // Check workspace_config mapping or file link
+    match fm.get("workspace_config") {
+        Some(YamlValue::Mapping(config_map)) => {
+            let lf_key = YamlValue::String("link_format".to_string());
+            if let Some(YamlValue::String(s)) = config_map.get(lf_key) {
+                if let Some(fmt) = parse_link_format_str(s) {
+                    return fmt;
+                }
+            }
+        }
+        Some(YamlValue::String(link_str)) => {
+            // File link to workspace config (e.g., "[Config](/Meta/Config.md)")
+            let config_rel = resolve_link_path(link_str, &root_rel);
+            let config_fs = to_fs_path(&config_rel, state.workspace_root.as_deref());
+            if let Ok(config_content) = host::fs::read_file(&config_fs) {
+                if let Ok((config_fm, _)) = parse_markdown(&config_content) {
+                    if let Some(YamlValue::String(s)) = config_fm.get("link_format") {
+                        if let Some(fmt) = parse_link_format_str(s) {
+                            return fmt;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    // Fall back to top-level link_format
+    if let Some(YamlValue::String(s)) = fm.get("link_format") {
+        if let Some(fmt) = parse_link_format_str(s) {
+            return fmt;
+        }
+    }
+
+    LinkFormat::default()
+}
+
+fn format_link_for(from_rel: &str, to_rel: &str, title: &str, format: LinkFormat) -> String {
+    format_link_with_format(to_rel, title, format, from_rel)
+}
+
+fn read_title_from_file(state: &DailyState, rel_path: &str) -> Option<String> {
+    let fs_path = to_fs_path(rel_path, state.workspace_root.as_deref());
+    let content = host::fs::read_file(&fs_path).ok()?;
+    let (fm, _) = parse_markdown(&content).ok()?;
+    fm.get("title")
+        .and_then(YamlValue::as_str)
+        .map(|s| s.to_string())
 }
 
 fn ensure_sequence(frontmatter_map: &mut IndexMap<String, YamlValue>, key: &str) -> Vec<String> {
@@ -350,7 +421,7 @@ fn ensure_index_file(
     rel_path: &str,
     title: &str,
     description: Option<&str>,
-    part_of: Option<&str>,
+    part_of: Option<(&str, &str)>,
 ) -> Result<bool, String> {
     let fs_path = to_fs_path(rel_path, state.workspace_root.as_deref());
     let exists = host::fs::file_exists(&fs_path)?;
@@ -379,10 +450,11 @@ fn ensure_index_file(
         changed = true;
     }
 
-    if let Some(parent_rel) = part_of {
-        let parent_ref = relative_ref(rel_path, parent_rel);
-        if fm.get("part_of").and_then(YamlValue::as_str) != Some(parent_ref.as_str()) {
-            fm.insert("part_of".to_string(), YamlValue::String(parent_ref));
+    if let Some((parent_rel, parent_title)) = part_of {
+        let parent_link =
+            format_link_for(rel_path, parent_rel, parent_title, state.link_format);
+        if fm.get("part_of").and_then(YamlValue::as_str) != Some(parent_link.as_str()) {
+            fm.insert("part_of".to_string(), YamlValue::String(parent_link));
             changed = true;
         }
     }
@@ -405,29 +477,71 @@ fn ensure_index_file(
     Ok(!exists)
 }
 
-fn add_to_contents(state: &DailyState, index_rel: &str, child_rel: &str) -> Result<bool, String> {
+fn add_to_contents(
+    state: &DailyState,
+    index_rel: &str,
+    child_rel: &str,
+    child_title: &str,
+) -> Result<bool, String> {
     let fs_path = to_fs_path(index_rel, state.workspace_root.as_deref());
     let content = host::fs::read_file(&fs_path)?;
     let (mut fm, body) = parse_markdown(&content)?;
 
     let mut contents = ensure_sequence(&mut fm, "contents");
-    let target = relative_ref(index_rel, child_rel);
-    if contents.iter().any(|c| c == &target) {
+    let child_canonical = normalize_rel_path(child_rel);
+    let new_entry = format_link_for(index_rel, child_rel, child_title, state.link_format);
+
+    // Check for existing entries pointing to the same canonical path
+    let mut found_exact = false;
+    let mut stale_indices = Vec::new();
+
+    for (i, entry) in contents.iter().enumerate() {
+        let parsed = parse_link(entry);
+        let canonical =
+            to_canonical_with_link_format(&parsed, Path::new(index_rel), Some(state.link_format));
+        if canonical == child_canonical {
+            if *entry == new_entry {
+                found_exact = true;
+            } else {
+                stale_indices.push(i);
+            }
+        }
+    }
+
+    if found_exact && stale_indices.is_empty() {
         return Ok(false);
     }
 
-    contents.push(target);
+    // Remove stale entries (reverse order to preserve indices)
+    for &i in stale_indices.iter().rev() {
+        contents.remove(i);
+    }
+
+    if !found_exact {
+        contents.push(new_entry);
+    }
+
     save_sequence(&mut fm, "contents", &contents);
     write_markdown(&fs_path, &fm, &body)?;
     Ok(true)
 }
 
-fn set_part_of(state: &DailyState, child_rel: &str, parent_rel: &str) -> Result<(), String> {
+fn set_part_of(
+    state: &DailyState,
+    child_rel: &str,
+    parent_rel: &str,
+    parent_title: &str,
+) -> Result<(), String> {
     let fs_path = to_fs_path(child_rel, state.workspace_root.as_deref());
     let content = host::fs::read_file(&fs_path)?;
     let (mut fm, body) = parse_markdown(&content)?;
-    let part_of = relative_ref(child_rel, parent_rel);
-    fm.insert("part_of".to_string(), YamlValue::String(part_of));
+    let new_part_of = format_link_for(child_rel, parent_rel, parent_title, state.link_format);
+
+    if fm.get("part_of").and_then(YamlValue::as_str) == Some(&new_part_of) {
+        return Ok(());
+    }
+
+    fm.insert("part_of".to_string(), YamlValue::String(new_part_of));
     write_markdown(&fs_path, &fm, &body)
 }
 
@@ -464,51 +578,59 @@ fn ensure_daily_entry_for_date(
 
     let year_title = date.format("%Y").to_string();
     let month_title = date.format("%B %Y").to_string();
+    let entry_title = date.format("%B %d, %Y").to_string();
+
+    let root_part_of: Option<(String, String)> = root_index_rel.as_deref().map(|rel| {
+        let title = read_title_from_file(state, rel).unwrap_or_else(|| "Index".to_string());
+        (rel.to_string(), title)
+    });
 
     ensure_index_file(
         state,
         &paths.daily_index,
         "Daily Index",
         Some("Date-based daily entry hierarchy"),
-        root_index_rel.as_deref(),
+        root_part_of
+            .as_ref()
+            .map(|(p, t)| (p.as_str(), t.as_str())),
     )?;
     ensure_index_file(
         state,
         &paths.year_index,
         &year_title,
         None,
-        Some(&paths.daily_index),
+        Some((&paths.daily_index, "Daily Index")),
     )?;
     ensure_index_file(
         state,
         &paths.month_index,
         &month_title,
         None,
-        Some(&paths.year_index),
+        Some((&paths.year_index, &year_title)),
     )?;
 
     if let Some(root_rel) = root_index_rel.as_deref()
         && root_rel != paths.daily_index
     {
-        add_to_contents(state, root_rel, &paths.daily_index)?;
+        add_to_contents(state, root_rel, &paths.daily_index, "Daily Index")?;
     }
 
-    add_to_contents(state, &paths.daily_index, &paths.year_index)?;
-    add_to_contents(state, &paths.year_index, &paths.month_index)?;
+    add_to_contents(state, &paths.daily_index, &paths.year_index, &year_title)?;
+    add_to_contents(state, &paths.year_index, &paths.month_index, &month_title)?;
 
     let entry_fs_path = to_fs_path(&paths.entry, state.workspace_root.as_deref());
     let existed = host::fs::file_exists(&entry_fs_path)?;
     if !existed {
-        let part_of = relative_ref(&paths.entry, &paths.month_index);
-        let title = date.format("%B %d, %Y").to_string();
+        let part_of =
+            format_link_for(&paths.entry, &paths.month_index, &month_title, state.link_format);
         let template = resolve_template_source(state);
         let now = current_local_datetime()?;
-        let content = render_template(&template, &title, date, &part_of, &now);
+        let content = render_template(&template, &entry_title, date, &part_of, &now);
         host::fs::write_file(&entry_fs_path, &content)?;
     }
 
-    set_part_of(state, &paths.entry, &paths.month_index)?;
-    add_to_contents(state, &paths.month_index, &paths.entry)?;
+    set_part_of(state, &paths.entry, &paths.month_index, &month_title)?;
+    add_to_contents(state, &paths.month_index, &paths.entry, &entry_title)?;
 
     Ok((paths.entry, !existed))
 }
@@ -607,7 +729,17 @@ fn update_workspace_root(workspace_root: Option<String>) -> Result<(), String> {
         Ok(())
     })?;
 
-    // Step 2: Attempt migration (reads/writes files). Non-fatal —
+    // Step 2: Read link_format from workspace root index.
+    let link_format = {
+        let state = current_state()?;
+        read_link_format(&state)
+    };
+    with_state_mut(|state| {
+        state.link_format = link_format;
+        Ok(())
+    })?;
+
+    // Step 3: Attempt migration (reads/writes files). Non-fatal —
     // if this fails, the workspace root is still set from step 1.
     let migration_result = with_state_mut(|state| {
         migrate_legacy_config(state)?;
@@ -894,11 +1026,21 @@ fn dispatch_command(command: &str, params: JsonValue) -> Result<JsonValue, Strin
                 };
 
                 if !dry_run {
-                    if let Err(e) = set_part_of(&state, &rel_path, &daily_path) {
+                    let parent_title = date.format("%B %d, %Y").to_string();
+                    let entry_title = read_title_from_file(&state, &rel_path)
+                        .unwrap_or_else(|| {
+                            Path::new(&rel_path)
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| rel_path.clone())
+                        });
+                    if let Err(e) = set_part_of(&state, &rel_path, &daily_path, &parent_title) {
                         errors.push(format!("{rel_path}: {e}"));
                         continue;
                     }
-                    if let Err(e) = add_to_contents(&state, &daily_path, &rel_path) {
+                    if let Err(e) =
+                        add_to_contents(&state, &daily_path, &rel_path, &entry_title)
+                    {
                         errors.push(format!("{rel_path}: {e}"));
                         continue;
                     }

@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "diaryx_daily_extism"
-version = "0.1.2"
+version = "0.1.7"
 dependencies = [
  "base64",
  "chrono",
@@ -154,8 +154,9 @@ dependencies = [
 
 [[package]]
 name = "diaryx_plugin_sdk"
-version = "0.1.0"
-source = "git+https://github.com/diaryx-org/plugin-sdk.git#7e8d831fdd05cca6e074b8c4df15f4b725a9ad40"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a95b9dda08938ddb1cf983b6a5c0e69f52a1a093cc54717a9819d7dca69d73d3"
 dependencies = [
  "base64",
  "extism-pdk",
